@@ -26,14 +26,17 @@ import java.util.TreeMap;
 
 public class CalculateAverage_cwdesautels {
     private static final String FILE = "./measurements.txt";
-    private static final int CORE_COUNT = 1;//Runtime.getRuntime().availableProcessors();
-    private static final byte SEPARATOR = ':';
+    private static final int CORE_COUNT = Runtime.getRuntime().availableProcessors();
+    private static final byte SEPARATOR = ';';
     private static final byte MINUS = '-';
-    private static final byte EOL = '\n';
+    private static final byte ZERO = '0';
     private static final byte DOT = '.';
-    private static final long CHUNK_SIZE = 4096;
+    private static final byte EOL = '\n';
+    private static final int NAME_SIZE = 100;
+    private static final int TEMP_SIZE = 4;
 
     public static void main(String[] args) throws InterruptedException, IOException {
+        final long start = System.currentTimeMillis();
         final ChannelReader[] readers = new ChannelReader[CORE_COUNT];
         final Thread[] threads = new Thread[CORE_COUNT];
         final TreeMap<String, Stat> merged = new TreeMap<>();
@@ -53,6 +56,7 @@ public class CalculateAverage_cwdesautels {
         }
 
         System.out.println(merged);
+        System.out.println("elapsed: " + (System.currentTimeMillis() - start) + "(ms)");
     }
 
     private static class ChannelReader implements Runnable {
@@ -60,7 +64,7 @@ public class CalculateAverage_cwdesautels {
         private final TreeMap<String, Stat> stats;
         private final long start;
         private final long size;
-        private final long sizeWithOverflow;
+        private final long max;
 
         public ChannelReader(FileChannel channel, long start, long size, long len) {
             this.channel = channel;
@@ -69,88 +73,87 @@ public class CalculateAverage_cwdesautels {
             this.size = start + size > len
                     ? len - start
                     : size;
-            this.sizeWithOverflow = start + size + 16 > len
+            this.max = start + this.size + NAME_SIZE + TEMP_SIZE > len
                     ? len - start
-                    : size + 16;
-
-            System.out.printf("size: %d, len: %d, of: %d, start: %d, end: %d%n", size, len, sizeWithOverflow, start, start + size);
-        }
-
-        private void skipLine(ByteBuffer buffer) {
-            while (buffer.hasRemaining()) {
-                if (buffer.get() == EOL) {
-                    break;
-                }
-            }
+                    : this.size + NAME_SIZE + TEMP_SIZE;
         }
 
         @Override
         public void run() {
-            // parse file
-            // if start is incomplete, ignore
-            // if end is incomplete continue
-
             try {
-                final ByteBuffer nameBuf = ByteBuffer.allocate(32);
-                final ByteBuffer tempBuf = ByteBuffer.allocate(32);
-                final ByteBuffer inputBuf = channel.map(FileChannel.MapMode.READ_ONLY, start, sizeWithOverflow);
-
-                boolean nameEnded = false;
+                final ByteBuffer buffer = channel.map(FileChannel.MapMode.READ_ONLY, start, max);
+                int i = 0;
+                int len = 0;
 
                 // Skip first partial record
                 if (start != 0) {
-                    skipLine(inputBuf);
+                    while (buffer.hasRemaining()) {
+                        if (buffer.get() == EOL) {
+                            break;
+                        }
+                    }
                 }
 
                 // Process records
-                // TODO: track only offsets and copy once into target buffers
-                while (inputBuf.hasRemaining()) {
-                    final byte data = inputBuf.get();
+                while (buffer.hasRemaining()) {
+                    final byte data = buffer.get();
 
-                    switch (data) {
-                        // case MINUS:
-                        // // one more
-                        // continue;
-                        case DOT:
-                            // get one more, short cut to EOL
-                            if (inputBuf.hasRemaining()) {
-                                tempBuf.put(inputBuf.get());
-                            }
+                    if (data == EOL) {
+                        // Reset station name position
+                        i = buffer.position();
+                        len = 0;
 
-                            skipLine(inputBuf);
-                        case EOL:
-                            // confirm end of temp, start of name
+                        // Terminate once we are past the size
+                        if (i > size) {
+                            break;
+                        }
+                    }
+                    else if (data == SEPARATOR) {
+                        // Take station up to the separator into shared byte array
+                        final String name = StandardCharsets.UTF_8.decode(buffer.slice(i, len)).toString();
 
-                            final String name = StandardCharsets.UTF_8.decode(nameBuf).toString();
-                            final int temp = tempBuf.getInt();
+                        // Take temperature after the separator
+                        final int t = getTemp(buffer);
 
-                            stats.compute(name, (__, stat) -> stat == null
-                                    ? new Stat(temp)
-                                    : stat.add(temp));
-
-                            nameBuf.clear();
-                            tempBuf.clear();
-                            nameEnded = false;
-
-                            if (inputBuf.position() >= start + size) {
-                                break;
-                            }
-
-                            continue;
-                        case SEPARATOR:
-                            nameEnded = true;
-                            continue;
-                        default:
-                            if (nameEnded) {
-                                tempBuf.put(data);
-                            } else {
-                                nameBuf.put(data);
-                            }
+                        // Upsert measurement
+                        stats.compute(name, (__, stat) -> stat == null
+                                ? new Stat(t)
+                                : stat.add(t));
+                    }
+                    else {
+                        len++;
                     }
                 }
-                // }
-            } catch (IOException e) {
+            }
+            catch (IOException e) {
                 throw new RuntimeException(e);
+            }
+        }
+
+        private int getTemp(ByteBuffer buffer) {
+            final byte b0 = buffer.get();
+            final byte b1 = buffer.get();
+            final byte b2 = buffer.get();
+
+            if (b0 == MINUS) {
+                final byte b3 = buffer.get();
+
+                if (b2 != DOT) { // 6 bytes: -dd.dn
+                    return -(((b1 - ZERO) * 10 + (b2 - ZERO)) * 10 + (b3 - ZERO));
+                }
+                else { // 5 bytes: -d.dn
+                    return -((b1 - ZERO) * 10 + (b3 - ZERO));
+                }
+            }
+            else {
+                if (b1 != DOT) { // 5 bytes: dd.dn
+                    final byte b3 = buffer.get();
+
+                    return ((b0 - ZERO) * 10 + (b1 - ZERO)) * 10 + (b3 - ZERO);
+                }
+                else { // 4 bytes: d.dn
+                    return (b0 - ZERO) * 10 + (b2 - ZERO);
+                }
             }
         }
 
@@ -165,7 +168,7 @@ public class CalculateAverage_cwdesautels {
     private static class Stat {
         private int min;
         private int max;
-        private long sum;
+        private int sum;
         private int count;
 
         private Stat(int v) {
